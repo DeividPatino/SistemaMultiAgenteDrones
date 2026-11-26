@@ -1,0 +1,14 @@
+sequenceDiagram
+    title Diagrama 1 - Solicitud y validación del pedido (FIPA-Request)
+    autonumber
+    participant C as «agent»<br/>AgenteCliente
+    participant G as «agent»<br/>AgenteGestorPedidos
+    C->>G: «ACL:REQUEST»<br/>solicitarPedido(paquete, ubicacionGPS)<br/>:protocol FIPA-Request
+    Note over G: validarPedido()
+    alt datos del usuario válidos
+        G-->>C: «ACL:AGREE»<br/>pedido_aceptado
+        Note over G: generarOrden()
+        G->>C: «ACL:INFORM»<br/>orden_creada(idOrden, estado = en_cola)
+    else datos inválidos
+        G-->>C: «ACL:REFUSE»<br/>pedido_rechazado(datos_invalidos)
+    end

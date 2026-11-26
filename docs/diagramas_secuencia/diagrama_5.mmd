@@ -1,0 +1,25 @@
+sequenceDiagram
+    title Diagrama 5 - Alertas de clima y zonas peligrosas (FIPA-Subscribe)
+    autonumber
+    participant T as «agent»<br/>AgenteTraficoClima
+    participant F as «agent»<br/>AgenteCoordinadorFlota
+    participant D as «agent»<br/>AgenteDron
+    F->>T: «ACL:SUBSCRIBE»<br/>notificar_alertas(sectores)<br/>:protocol FIPA-Subscribe
+    D->>T: «ACL:SUBSCRIBE»<br/>notificar_alertas(ruta_actual)
+    T-->>F: «ACL:AGREE»
+    T-->>D: «ACL:AGREE»
+    Note over T: detectar ráfaga de viento / lluvia<br/>emitirAlerta()
+    par alerta a suscriptores
+        T->>F: «ACL:INFORM»<br/>alerta_clima(sector, severidad)
+    and
+        T->>D: «ACL:INFORM»<br/>alerta_clima(sector, severidad)
+    end
+    alt severidad crítica
+        F->>D: «ACL:CANCEL»<br/>cancelar_entrega(idOrden)
+        Note over D: aterrizar / ir a cargar batería
+        D->>F: «ACL:INFORM»<br/>entrega_cancelada(idOrden)
+    else severidad moderada
+        D->>F: «ACL:REQUEST»<br/>solicitarNuevaRuta(idOrden, evitar = sector)
+        F-->>D: «ACL:AGREE»
+        F->>D: «ACL:INFORM»<br/>nueva_ruta(idOrden, ruta)
+    end

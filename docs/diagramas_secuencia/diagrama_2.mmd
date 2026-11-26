@@ -1,0 +1,17 @@
+sequenceDiagram
+    title Diagrama 2 - Envío de la orden y consulta de condiciones de vuelo (FIPA-Request / FIPA-Query)
+    autonumber
+    participant G as «agent»<br/>AgenteGestorPedidos
+    participant F as «agent»<br/>AgenteCoordinadorFlota
+    participant T as «agent»<br/>AgenteTraficoClima
+    G->>F: «ACL:REQUEST»<br/>despacharOrden(idOrden, ubicacionGPS)
+    F-->>G: «ACL:AGREE»<br/>orden_recibida
+    F->>T: «ACL:QUERY-IF»<br/>zona_habilitada(sector_destino)?<br/>:protocol FIPA-Query
+    Note over T: verificarZona()
+    alt camino despejado
+        T->>F: «ACL:INFORM»<br/>zona_habilitada(sector_destino) = true<br/>clima = favorable
+        Note over F: continúa con la asignación del dron (Diagrama 3)
+    else zona restringida o clima peligroso
+        T->>F: «ACL:INFORM»<br/>zona_restringida(sector_destino) = true
+        F->>G: «ACL:INFORM»<br/>orden_en_espera(idOrden, motivo)
+    end

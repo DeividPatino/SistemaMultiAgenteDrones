@@ -1,0 +1,23 @@
+sequenceDiagram
+    title Diagrama 6 - Falla durante la entrega y reasignación (FIPA-Request)
+    autonumber
+    participant D as «agent»<br/>AgenteDron
+    participant F as «agent»<br/>AgenteCoordinadorFlota
+    participant G as «agent»<br/>AgenteGestorPedidos
+    participant C as «agent»<br/>AgenteCliente
+    Note over D: detecta falla mecánica o<br/>cambio brusco de clima
+    D->>F: «ACL:FAILURE»<br/>entrega_abortada(idOrden, causa)
+    F->>D: «ACL:REQUEST»<br/>aterrizar_y_retornar_a_base
+    D-->>F: «ACL:AGREE»
+    D->>C: «ACL:INFORM»<br/>entrega_demorada(idOrden)
+    F->>G: «ACL:INFORM»<br/>orden_pendiente_reasignacion(idOrden)
+    Note over G: estadoOrden = en_cola
+    G->>F: «ACL:REQUEST»<br/>despacharOrden(idOrden)
+    Note over F: reinicia la asignación de dron<br/>(CFP, ver Diagrama 3)
+    alt hay dron disponible
+        F->>G: «ACL:INFORM»<br/>dron_reasignado(idOrden, nuevaETA)
+        G->>C: «ACL:INFORM»<br/>nueva_hora_estimada(idOrden)
+    else sin drones disponibles
+        F->>G: «ACL:FAILURE»<br/>sin_drones_disponibles(idOrden)
+        G->>C: «ACL:INFORM»<br/>entrega_reprogramada(idOrden)
+    end

@@ -1,0 +1,23 @@
+sequenceDiagram
+    title Diagrama 4 - Ejecución de la entrega y confirmación con PIN (FIPA-Request)
+    autonumber
+    participant F as «agent»<br/>AgenteCoordinadorFlota
+    participant D as «agent»<br/>AgenteDron
+    participant C as «agent»<br/>AgenteCliente
+    D->>C: «ACL:INFORM»<br/>hora_estimada_llegada(idOrden, ETA)
+    loop durante el vuelo
+        Note over D: navegarRuta()<br/>detectarObstaculo() / evitarColisiones()
+    end
+    D->>C: «ACL:REQUEST»<br/>confirmarPresencia(idOrden)
+    alt cliente disponible y PIN correcto
+        C->>D: «ACL:INFORM»<br/>confirmacionPIN(****)
+        Note over D: validarPIN()
+        Note over D: entregarPaquete()
+        D->>C: «ACL:INFORM»<br/>paquete_entregado(idOrden)
+        C->>D: «ACL:INFORM»<br/>recepcion_confirmada
+        D->>F: «ACL:INFORM»<br/>entrega_exitosa(idOrden)
+    else cliente no disponible o PIN incorrecto
+        C->>D: «ACL:REQUEST»<br/>reprogramarEntrega(idOrden, nuevaHora)
+        D-->>C: «ACL:AGREE»<br/>reprogramacion_aceptada
+        D->>F: «ACL:INFORM»<br/>entrega_reprogramada(idOrden, nuevaHora)
+    end

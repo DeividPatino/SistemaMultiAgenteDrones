@@ -1,0 +1,29 @@
+sequenceDiagram
+    title Diagrama 3 - Asignación del dron (FIPA-Contract-Net)
+    autonumber
+    participant F as «agent»<br/>AgenteCoordinadorFlota
+    participant D1 as «agent»<br/>AgenteDron 1
+    participant D2 as «agent»<br/>AgenteDron 2
+    participant D3 as «agent»<br/>AgenteDron 3
+    Note over F: dronesDisponibles = [D1, D2, D3]
+    par CFP a drones disponibles
+        F->>D1: «ACL:CFP»<br/>entregar(idOrden, distancia)<br/>:protocol FIPA-Contract-Net
+    and
+        F->>D2: «ACL:CFP»<br/>entregar(idOrden, distancia)
+    and
+        F->>D3: «ACL:CFP»<br/>entregar(idOrden, distancia)
+    end
+    Note over D1: revisar nivelBateria
+    Note over D2: revisar nivelBateria
+    Note over D3: revisar nivelBateria
+    D1->>F: «ACL:PROPOSE»<br/>bateria = 85%, ETA = 8 min
+    D2->>F: «ACL:PROPOSE»<br/>bateria = 60%, ETA = 12 min
+    D3-->>F: «ACL:REFUSE»<br/>bateria_insuficiente
+    Note over F: optimizarEntregas()<br/>(elige mayor utilidad)
+    alt hay al menos una propuesta
+        F->>D1: «ACL:ACCEPT-PROPOSAL»<br/>asignarDron(idOrden, ruta)
+        F->>D2: «ACL:REJECT-PROPOSAL»<br/>propuesta_no_seleccionada
+        D1->>F: «ACL:INFORM»<br/>ruta_asignada(idOrden)
+    else ningún dron propone
+        Note over F: la orden permanece en colaEntregas<br/>y se reintenta el CFP
+    end
