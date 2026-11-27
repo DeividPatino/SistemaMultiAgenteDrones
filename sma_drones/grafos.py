@@ -605,6 +605,10 @@ def _g5_critica(state):
     dron.irACargar()
     if dron.estado != EstadoDron.CARGANDO:
         raise RuntimeError("El dron no quedó en estado de carga")
+    orden.estado = EstadoPedido.EN_COLA
+    cola = state["sistema"].coordinador.colaEntregas
+    if not any(pedido is orden for pedido in cola):
+        cola.append(orden)
     return {"trazas": [
         acl("CANCEL", "AgenteCoordinadorFlota", dron.idDron,
             f"cancelar_entrega({orden.id_pedido})"),

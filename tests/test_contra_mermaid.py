@@ -6,7 +6,8 @@ coinciden con las flechas ACL del diagrama (performativa, emisor, receptor).
 import os
 import re
 import unittest
-from sma_drones.grafos import ejecutar
+from sma_drones.agentes import EstadoDron, EstadoPedido
+from sma_drones.grafos import CONSTRUCTORES, _estado_para_variante, ejecutar
 
 DOCS = os.path.join(os.path.dirname(__file__), "..", "docs", "diagramas_secuencia")
 
@@ -195,11 +196,22 @@ class TestGrafo5(unittest.TestCase):
         mmd = _leer_mmd(5)
         alias = _parsear_alias(mmd)
         ramas = _parsear_flechas(mmd, alias)
-        trazas = ejecutar(5, "critica")
+        estado = _estado_para_variante(5, "critica")
+        orden = estado["orden"]
+        dron = estado["dron_seleccionado"]
+        resultado = CONSTRUCTORES[5]().invoke(estado)
+        trazas = resultado["trazas"]
         esperado = ramas["principal"]
         obtenido = _acl_de_trazas(trazas)
         self.assertEqual(obtenido, esperado,
                         f"Grafo 5/critica:\n  esperado={esperado}\n  obtenido={obtenido}")
+        self.assertEqual(dron.estado, EstadoDron.CARGANDO)
+        self.assertEqual(orden.estado, EstadoPedido.EN_COLA)
+        self.assertEqual(
+            sum(pedido is orden
+                for pedido in estado["sistema"].coordinador.colaEntregas),
+            1,
+        )
 
     def test_moderada(self):
         mmd = _leer_mmd(5)
