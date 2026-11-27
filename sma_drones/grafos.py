@@ -683,11 +683,11 @@ def _g6_coordinador_responde(state):
         acl("REQUEST", "AgenteCoordinadorFlota", "AgenteDron1",
             "aterrizar_y_retornar_a_base"),
         acl("AGREE", "AgenteDron1", "AgenteCoordinadorFlota", ""),
+        nota("AgenteDron1",
+             "AGREE representa aceptación lógica de la solicitud; "
+             "no confirma ni simula el retorno físico"),
         acl("INFORM", "AgenteDron1", "AgenteCliente",
             f"entrega_demorada({orden.id_pedido})"),
-        nota("AgenteDron1",
-             "la solicitud de retorno queda en la traza; el modelo no "
-             "implementa una maniobra física"),
     ]}
 
 
@@ -788,7 +788,7 @@ def _g6_sin_drones(state):
         acl("FAILURE", "AgenteCoordinadorFlota", "AgenteGestorPedidos",
             f"sin_drones_disponibles({orden.id_pedido})"),
         acl("INFORM", "AgenteGestorPedidos", "AgenteCliente",
-            f"entrega_reprogramada({orden.id_pedido})"),
+            f"orden_pendiente_reasignacion({orden.id_pedido})"),
     ], "dron_seleccionado": None}
 
 

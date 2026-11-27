@@ -229,21 +229,89 @@ class TestGrafo6(unittest.TestCase):
         mmd = _leer_mmd(6)
         alias = _parsear_alias(mmd)
         ramas = _parsear_flechas(mmd, alias)
-        trazas = ejecutar(6, "con_dron")
+        estado = _estado_para_variante(6, "con_dron")
+        orden = estado["orden"]
+        sistema = estado["sistema"]
+        dron_fallado = estado["dron_seleccionado"]
+        resultado = CONSTRUCTORES[6]().invoke(estado)
+        trazas = resultado["trazas"]
         esperado = ramas["principal"]
         obtenido = _acl_de_trazas(trazas)
         self.assertEqual(obtenido, esperado,
                         f"Grafo 6/con_dron:\n  esperado={esperado}\n  obtenido={obtenido}")
+        dron_sustituto = resultado["dron_seleccionado"]
+        self.assertIs(resultado["orden"], orden)
+        self.assertIs(resultado["dron_fallado"], dron_fallado)
+        self.assertEqual(dron_fallado.estado, EstadoDron.FALLA)
+        self.assertIsNot(dron_sustituto, dron_fallado)
+        self.assertIn(dron_sustituto, sistema.drones)
+        self.assertEqual(dron_sustituto.estado, EstadoDron.ASIGNADO)
+        self.assertEqual(orden.estado, EstadoPedido.ASIGNADO)
+        self.assertEqual(
+            sum(pedido is orden for pedido in sistema.gestor.listaPedidos), 1
+        )
+        self.assertFalse(any(
+            pedido is orden for pedido in sistema.coordinador.colaEntregas
+        ))
+        self.assertTrue(any(
+            mensaje["tipo"] == "acl"
+            and mensaje["contenido"].startswith("dron_reasignado(")
+            for mensaje in trazas
+        ))
 
     def test_sin_drones(self):
         mmd = _leer_mmd(6)
         alias = _parsear_alias(mmd)
         ramas = _parsear_flechas(mmd, alias)
-        trazas = ejecutar(6, "sin_drones")
+        estado = _estado_para_variante(6, "sin_drones")
+        orden = estado["orden"]
+        sistema = estado["sistema"]
+        dron_fallado = estado["dron_seleccionado"]
+        resultado = CONSTRUCTORES[6]().invoke(estado)
+        trazas = resultado["trazas"]
         esperado = ramas["else"]
         obtenido = _acl_de_trazas(trazas)
         self.assertEqual(obtenido, esperado,
                         f"Grafo 6/sin_drones:\n  esperado={esperado}\n  obtenido={obtenido}")
+        self.assertIs(resultado["orden"], orden)
+        self.assertIs(resultado["dron_fallado"], dron_fallado)
+        self.assertIsNone(resultado["dron_seleccionado"])
+        self.assertEqual(dron_fallado.estado, EstadoDron.FALLA)
+        self.assertEqual(orden.estado, EstadoPedido.EN_COLA)
+        self.assertEqual(
+            sum(pedido is orden for pedido in sistema.gestor.listaPedidos), 1
+        )
+        self.assertEqual(
+            sum(
+                pedido is orden
+                for pedido in sistema.coordinador.colaEntregas
+            ),
+            1,
+        )
+        self.assertFalse(any(
+            dron.estado == EstadoDron.ASIGNADO
+            for dron in sistema.drones
+            if dron is not dron_fallado
+        ))
+        mensajes_al_cliente = [
+            mensaje for mensaje in trazas
+            if mensaje["tipo"] == "acl"
+            and mensaje["emisor"] == "AgenteGestorPedidos"
+            and mensaje["receptor"] == "AgenteCliente"
+            and mensaje["performativa"] == "INFORM"
+        ]
+        self.assertEqual(len(mensajes_al_cliente), 1)
+        self.assertIn(
+            "orden_pendiente_reasignacion",
+            mensajes_al_cliente[0]["contenido"],
+        )
+        self.assertNotIn("reprogramada", mensajes_al_cliente[0]["contenido"])
+        self.assertNotIn("dron_reasignado", mensajes_al_cliente[0]["contenido"])
+        self.assertFalse(any(
+            mensaje["tipo"] == "acl"
+            and "dron_reasignado(" in mensaje["contenido"]
+            for mensaje in trazas
+        ))
 
 
 if __name__ == "__main__":
