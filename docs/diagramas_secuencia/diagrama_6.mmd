@@ -19,5 +19,5 @@ sequenceDiagram
         G->>C: «ACL:INFORM»<br/>nueva_hora_estimada(idOrden)
     else sin drones disponibles
         F->>G: «ACL:FAILURE»<br/>sin_drones_disponibles(idOrden)
-        G->>C: «ACL:INFORM»<br/>entrega_reprogramada(idOrden)
+        G->>C: «ACL:INFORM»<br/>orden_pendiente_reasignacion(idOrden)
     end

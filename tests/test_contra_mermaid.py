@@ -6,7 +6,7 @@ coinciden con las flechas ACL del diagrama (performativa, emisor, receptor).
 import os
 import re
 import unittest
-from sma_drones.agentes import EstadoDron, EstadoPedido
+from sma_drones.agentes import Alerta, EstadoDron, EstadoPedido
 from sma_drones.grafos import CONSTRUCTORES, _estado_para_variante, ejecutar
 
 DOCS = os.path.join(os.path.dirname(__file__), "..", "docs", "diagramas_secuencia")
@@ -42,10 +42,8 @@ def _parsear_alias(mmd_text):
     return alias_map
 
 
-def _parsear_flechas(mmd_text, alias_map):
-    """Extrae las flechas ACL del mermaid, separando ramas alt/else.
-    Devuelve un dict con las claves 'principal' y 'else'.
-    """
+def _parsear_acls_mermaid(mmd_text, alias_map):
+    """Extrae firma, contenido y protocolo de las flechas ACL del Mermaid."""
     lineas = mmd_text.strip().split("\n")
     rama_actual = "principal"
     ramas = {"principal": [], "else": []}
@@ -78,13 +76,34 @@ def _parsear_flechas(mmd_text, alias_map):
             emisor = emisor.replace(" ", "")
             receptor = receptor.replace(" ", "")
             if en_alt or rama_actual != "principal":
-                ramas[rama_actual].append((performativa, emisor, receptor))
+                destino = (rama_actual,)
             else:
-                # Fuera de alt: va en ambas ramas
-                ramas["principal"].append((performativa, emisor, receptor))
-                ramas["else"].append((performativa, emisor, receptor))
+                destino = ("principal", "else")
 
+            partes = linea[m.end():].strip()
+            if partes.startswith("<br/>"):
+                partes = partes[len("<br/>"):]
+            segmentos = partes.split("<br/>") if partes else []
+            contenido = segmentos[0].strip() if segmentos else ""
+            protocolo = ""
+            for segmento in segmentos[1:]:
+                segmento = segmento.strip()
+                if segmento.startswith(":protocol "):
+                    protocolo = segmento[len(":protocol "):].strip()
+                    break
+            mensaje = (performativa, emisor, receptor, contenido, protocolo)
+            for rama in destino:
+                ramas[rama].append(mensaje)
     return ramas
+
+
+def _parsear_flechas(mmd_text, alias_map):
+    """Extrae la firma ACL por rama, conservando el helper existente."""
+    detalladas = _parsear_acls_mermaid(mmd_text, alias_map)
+    return {
+        rama: [mensaje[:3] for mensaje in mensajes]
+        for rama, mensajes in detalladas.items()
+    }
 
 
 def _leer_mmd(n):
@@ -98,6 +117,100 @@ def _acl_de_trazas(trazas):
     """Filtra solo los mensajes ACL de las trazas y devuelve (perf, emisor, receptor)."""
     return [(t["performativa"], t["emisor"], t["receptor"])
             for t in trazas if t["tipo"] == "acl"]
+
+
+def _acl_detalladas_de_trazas(trazas):
+    """Filtra ACL como (performativa, emisor, receptor, contenido, protocolo)."""
+    return [
+        (
+            mensaje["performativa"],
+            mensaje["emisor"],
+            mensaje["receptor"],
+            mensaje["contenido"],
+            mensaje.get("protocolo", ""),
+        )
+        for mensaje in trazas
+        if mensaje["tipo"] == "acl"
+    ]
+
+
+def _normalizar_contenido_acl(contenido):
+    """Normaliza solo el formato numérico equivalente, por ejemplo 8.0 -> 8."""
+    return re.sub(r"(?<=\d)\.0(?=\s|,|\)|$)", "", contenido)
+
+
+def _assert_acls_mermaid(
+    testcase,
+    trazas,
+    mmd_text,
+    alias_map,
+    rama,
+    sustituciones=None,
+    protocolos_comunes=None,
+    performativas=None,
+):
+    """Compara secuencia, firma, contenido y protocolo contra una rama Mermaid."""
+    esperados = _parsear_acls_mermaid(mmd_text, alias_map)[rama]
+    if performativas is not None:
+        esperados = [
+            mensaje for mensaje in esperados
+            if mensaje[0] in performativas
+        ]
+    sustituciones = sustituciones or {}
+    protocolos_comunes = protocolos_comunes or {}
+    esperados_normalizados = []
+    for performativa, emisor, receptor, contenido, protocolo in esperados:
+        for marcador, valor in sustituciones.items():
+            contenido = contenido.replace(marcador, str(valor))
+        if not protocolo:
+            protocolo = protocolos_comunes.get(performativa, "")
+        esperados_normalizados.append((
+            performativa,
+            emisor,
+            receptor,
+            _normalizar_contenido_acl(contenido),
+            protocolo,
+        ))
+
+    obtenidos = [
+        (
+            performativa,
+            emisor,
+            receptor,
+            _normalizar_contenido_acl(contenido),
+            protocolo,
+        )
+        for performativa, emisor, receptor, contenido, protocolo
+        in _acl_detalladas_de_trazas(trazas)
+        if performativas is None or performativa in performativas
+    ]
+    testcase.assertEqual(obtenidos, esperados_normalizados)
+
+
+def _assert_alerta_grafo5(testcase, estado, resultado, severidad):
+    sistema = estado["sistema"]
+    orden = estado["orden"]
+    dron = estado["dron_seleccionado"]
+    alerta = resultado["alerta_clima"]
+
+    testcase.assertIsInstance(alerta, Alerta)
+    testcase.assertIs(alerta, sistema.trafico.mapaAlertas[orden.ubicacion])
+    testcase.assertEqual(alerta.sector, orden.ubicacion)
+    testcase.assertEqual(alerta.severidad, severidad)
+    testcase.assertEqual(resultado["severidad"], severidad)
+    testcase.assertEqual(
+        resultado["suscriptores_alertas"],
+        ["AgenteCoordinadorFlota", dron.idDron],
+    )
+    testcase.assertEqual(
+        sum(alerta_recibida is alerta
+            for alerta_recibida in sistema.coordinador.alertasTrafico),
+        1,
+    )
+    testcase.assertEqual(
+        sum(alerta_recibida is alerta for alerta_recibida in dron.alertasRecibidas),
+        1,
+    )
 
 
 class TestGrafo1(unittest.TestCase):
@@ -149,24 +262,106 @@ class TestGrafo3(unittest.TestCase):
         mmd = _leer_mmd(3)
         alias = _parsear_alias(mmd)
         ramas = _parsear_flechas(mmd, alias)
-        trazas = ejecutar(3, "normal")
+        estado = _estado_para_variante(3, "normal")
+        sistema = estado["sistema"]
+        orden = estado["orden"]
+        drones = list(sistema.drones)
+        resultado = CONSTRUCTORES[3]().invoke(estado)
+        trazas = resultado["trazas"]
         esperado = ramas["principal"]
         obtenido = _acl_de_trazas(trazas)
         self.assertEqual(obtenido, esperado,
                         f"Grafo 3/normal:\n  esperado={esperado}\n  obtenido={obtenido}")
+        _assert_acls_mermaid(
+            self,
+            trazas,
+            mmd,
+            alias,
+            "principal",
+            sustituciones={
+                "idOrden": orden.id_pedido,
+                "distancia": estado["distancia_km"],
+            },
+            # FIPA-Contract-Net está declarado una vez para el grupo de CFP.
+            protocolos_comunes={"CFP": "FIPA-Contract-Net"},
+        )
+
+        ganador = resultado["dron_seleccionado"]
+        propuesta_ganadora = max(
+            resultado["propuestas"],
+            key=lambda propuesta: propuesta["utilidad"],
+        )
+        self.assertIs(resultado["orden"], orden)
+        self.assertIs(resultado["propuesta_seleccionada"], propuesta_ganadora)
+        self.assertIs(ganador, propuesta_ganadora["dron"])
+        asignacion_acl = next(
+            mensaje for mensaje in trazas
+            if mensaje["tipo"] == "acl"
+            and mensaje["performativa"] == "ACCEPT-PROPOSAL"
+        )
+        self.assertEqual(asignacion_acl["receptor"], ganador.idDron)
+        self.assertEqual(
+            asignacion_acl["contenido"],
+            f"asignarDron({orden.id_pedido}, ruta)",
+        )
+        self.assertEqual(ganador.estado, EstadoDron.ASIGNADO)
+        self.assertEqual(orden.estado, EstadoPedido.ASIGNADO)
+        self.assertEqual(len(sistema.gestor.listaPedidos), 1)
+        self.assertIs(sistema.gestor.listaPedidos[0], orden)
+        self.assertEqual(sistema.coordinador.colaEntregas, [])
+        for dron in drones:
+            if dron is not ganador:
+                self.assertEqual(dron.estado, EstadoDron.LIBRE)
 
     def test_sin_propuestas(self):
         """Los 3 drones rechazan: se comparan los CFP y 3 REFUSE."""
         mmd = _leer_mmd(3)
         alias = _parsear_alias(mmd)
         ramas = _parsear_flechas(mmd, alias)
-        trazas = ejecutar(3, "sin_propuestas")
+        estado = _estado_para_variante(3, "sin_propuestas")
+        sistema = estado["sistema"]
+        orden = estado["orden"]
+        drones = list(sistema.drones)
+        resultado = CONSTRUCTORES[3]().invoke(estado)
+        trazas = resultado["trazas"]
         obtenido = _acl_de_trazas(trazas)
+        _assert_acls_mermaid(
+            self,
+            trazas,
+            mmd,
+            alias,
+            "principal",
+            sustituciones={
+                "idOrden": orden.id_pedido,
+                "distancia": estado["distancia_km"],
+            },
+            protocolos_comunes={"CFP": "FIPA-Contract-Net"},
+            performativas={"CFP"},
+        )
         # Esperamos: 3 CFP + 3 REFUSE (no hay propuestas)
         cfps = [(p, e, r) for p, e, r in obtenido if p == "CFP"]
         refuses = [(p, e, r) for p, e, r in obtenido if p == "REFUSE"]
         self.assertEqual(len(cfps), 3, f"Debe haber 3 CFP, hay {len(cfps)}")
         self.assertEqual(len(refuses), 3, f"Debe haber 3 REFUSE, hay {len(refuses)}")
+        self.assertEqual(
+            _acl_detalladas_de_trazas(trazas)[3:],
+            [
+                ("REFUSE", dron.idDron, "AgenteCoordinadorFlota",
+                 "bateria_insuficiente", "")
+                for dron in drones
+            ],
+        )
+        self.assertEqual(resultado["propuestas"], [])
+        self.assertIsNone(resultado["propuesta_seleccionada"])
+        self.assertIsNone(resultado["dron_seleccionado"])
+        self.assertIs(resultado["orden"], orden)
+        self.assertEqual(orden.estado, EstadoPedido.EN_COLA)
+        self.assertEqual(len(sistema.gestor.listaPedidos), 1)
+        self.assertIs(sistema.gestor.listaPedidos[0], orden)
+        self.assertEqual(sistema.coordinador.colaEntregas, [orden])
+        self.assertIs(sistema.coordinador.colaEntregas[0], orden)
+        for dron in drones:
+            self.assertEqual(dron.estado, EstadoDron.LIBRE)
 
 
 class TestGrafo4(unittest.TestCase):
@@ -197,6 +392,7 @@ class TestGrafo5(unittest.TestCase):
         alias = _parsear_alias(mmd)
         ramas = _parsear_flechas(mmd, alias)
         estado = _estado_para_variante(5, "critica")
+        sistema = estado["sistema"]
         orden = estado["orden"]
         dron = estado["dron_seleccionado"]
         resultado = CONSTRUCTORES[5]().invoke(estado)
@@ -205,23 +401,71 @@ class TestGrafo5(unittest.TestCase):
         obtenido = _acl_de_trazas(trazas)
         self.assertEqual(obtenido, esperado,
                         f"Grafo 5/critica:\n  esperado={esperado}\n  obtenido={obtenido}")
+        _assert_acls_mermaid(
+            self,
+            trazas,
+            mmd,
+            alias,
+            "principal",
+            sustituciones={"idOrden": orden.id_pedido},
+        )
+        _assert_alerta_grafo5(self, estado, resultado, "critica")
+        self.assertIs(resultado["orden"], orden)
+        self.assertIs(resultado["dron_seleccionado"], dron)
         self.assertEqual(dron.estado, EstadoDron.CARGANDO)
         self.assertEqual(orden.estado, EstadoPedido.EN_COLA)
-        self.assertEqual(
-            sum(pedido is orden
-                for pedido in estado["sistema"].coordinador.colaEntregas),
-            1,
-        )
+        self.assertEqual(sistema.coordinador.colaEntregas, [orden])
+        self.assertIs(sistema.coordinador.colaEntregas[0], orden)
 
     def test_moderada(self):
+        """La ruta se inspecciona estructuralmente, no se prueba su no-cálculo universal."""
         mmd = _leer_mmd(5)
         alias = _parsear_alias(mmd)
         ramas = _parsear_flechas(mmd, alias)
-        trazas = ejecutar(5, "moderada")
+        estado = _estado_para_variante(5, "moderada")
+        sistema = estado["sistema"]
+        orden = estado["orden"]
+        dron = estado["dron_seleccionado"]
+        resultado = CONSTRUCTORES[5]().invoke(estado)
+        trazas = resultado["trazas"]
         esperado = ramas["else"]
         obtenido = _acl_de_trazas(trazas)
         self.assertEqual(obtenido, esperado,
                         f"Grafo 5/moderada:\n  esperado={esperado}\n  obtenido={obtenido}")
+        _assert_acls_mermaid(
+            self,
+            trazas,
+            mmd,
+            alias,
+            "else",
+            sustituciones={"idOrden": orden.id_pedido},
+        )
+        _assert_alerta_grafo5(self, estado, resultado, "moderada")
+        self.assertIs(resultado["orden"], orden)
+        self.assertIs(resultado["dron_seleccionado"], dron)
+        self.assertEqual(orden.estado, EstadoPedido.ASIGNADO)
+        self.assertEqual(dron.estado, EstadoDron.ASIGNADO)
+        self.assertEqual(sistema.coordinador.colaEntregas, [])
+        # La rama solo invoca solicitarNuevasRutas() y solicitarRutas();
+        # ambas devuelven True. Este barrido se limita a estos objetos/atributos:
+        # no garantiza que no hubiera cálculo temporal, almacenamiento indirecto
+        # u otra representación de ruta fuera de los objetos inspeccionados.
+        self.assertFalse(any("ruta" in clave.lower() for clave in resultado))
+        for objeto in (
+            sistema,
+            sistema.coordinador,
+            sistema.trafico,
+            orden,
+            dron,
+        ):
+            self.assertFalse(any(
+                "ruta" in atributo.lower() for atributo in vars(objeto)
+            ))
+        self.assertTrue(any(
+            mensaje["tipo"] == "nota"
+            and "no calculan" in mensaje["texto"]
+            for mensaje in trazas
+        ))
 
 
 class TestGrafo6(unittest.TestCase):
@@ -312,6 +556,25 @@ class TestGrafo6(unittest.TestCase):
             and "dron_reasignado(" in mensaje["contenido"]
             for mensaje in trazas
         ))
+        self.assertIs(
+            mensajes_al_cliente[0],
+            next(
+                mensaje for mensaje in reversed(trazas)
+                if mensaje["tipo"] == "acl"
+            ),
+        )
+        bloque_sin_drones = mmd.split(
+            "else sin drones disponibles", 1
+        )[1].split("\n    end", 1)[0]
+        contenido_diagrama = next(
+            linea.strip().split("<br/>", 1)[1]
+            for linea in bloque_sin_drones.splitlines()
+            if linea.strip().startswith("G->>C: «ACL:INFORM»")
+        )
+        self.assertEqual(
+            mensajes_al_cliente[0]["contenido"],
+            contenido_diagrama.replace("idOrden", orden.id_pedido),
+        )
 
 
 if __name__ == "__main__":
