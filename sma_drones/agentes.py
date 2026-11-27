@@ -175,7 +175,8 @@ class AgenteGestorPedidos:
 
     def generarOrden(self, datos):
         """Genera una orden a partir de los datos validados."""
-        orden = Pedido(id_pedido="ORD-001", paquete=datos["paquete"],
+        id_pedido = f"ORD-{len(self.listaPedidos) + 1:03d}"
+        orden = Pedido(id_pedido=id_pedido, paquete=datos["paquete"],
                        ubicacion=datos["ubicacion"], estado=EstadoPedido.EN_COLA)
         self.listaPedidos.append(orden)
         self.estadoOrden = EstadoPedido.EN_COLA
@@ -221,6 +222,11 @@ class AgenteCoordinadorFlota:
 
     def asignarDron(self, id_dron, id_orden):
         """Asigna un dron a una orden."""
+        dron = next((d for d in self.dronesDisponibles
+                     if d.idDron == id_dron and d.estado == EstadoDron.LIBRE), None)
+        if dron is None:
+            raise ValueError(f"El dron {id_dron} no está disponible")
+        dron.estado = EstadoDron.ASIGNADO
         return {"id_dron": id_dron, "id_orden": id_orden}
 
     def monitorearBateria(self):

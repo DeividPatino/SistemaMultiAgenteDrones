@@ -7,6 +7,9 @@ import operator
 from typing import Annotated, TypedDict
 from langgraph.graph import StateGraph, END
 
+from sma_drones.agentes import (
+    AgenteDron, Alerta, EstadoDron, EstadoPedido, Pedido, SistemaEntregaDrones,
+)
 from sma_drones.mensajes import acl, nota
 
 
@@ -17,30 +20,51 @@ from sma_drones.mensajes import acl, nota
 class Estado(TypedDict):
     trazas: Annotated[list, operator.add]
     # Datos que viajan entre nodos
+    sistema: SistemaEntregaDrones
     pedido: dict
-    orden: dict
+    orden: Pedido | None
+    condiciones_vuelo: dict
+    zona_restringida: bool
+    clima_favorable: bool
     drones_info: list
+    pedido_valido: bool
+    dron_seleccionado: AgenteDron | None
+    propuestas: list
+    propuesta_seleccionada: dict | None
     variante: str
     distancia_km: float
     pin_cliente: str
+    pin_valido: bool
     severidad: str
+    alerta_clima: Alerta | None
+    suscriptores_alertas: list[str]
+    dron_fallado: AgenteDron | None
 
 
-def estado_inicial(variante="ok", **extra):
+def estado_inicial(variante="ok", sistema=None, **extra):
     """Crea un estado inicial con valores por defecto."""
+    sistema = sistema if sistema is not None else SistemaEntregaDrones()
     base = {
         "trazas": [],
+        "sistema": sistema,
         "pedido": {"paquete": "Paquete-001", "ubicacion": "Bocagrande"},
-        "orden": {"idOrden": "ORD-001", "estado": "en_cola", "ubicacion": "Bocagrande"},
-        "drones_info": [
-            {"id": "AgenteDron1", "bateria": 85, "velocidad": 22.5},
-            {"id": "AgenteDron2", "bateria": 60, "velocidad": 15.0},
-            {"id": "AgenteDron3", "bateria": 25, "velocidad": 20.0},
-        ],
+        "orden": None,
+        "condiciones_vuelo": {},
+        "zona_restringida": False,
+        "clima_favorable": True,
+        "drones_info": sistema.drones,
+        "pedido_valido": False,
+        "dron_seleccionado": None,
+        "propuestas": [],
+        "propuesta_seleccionada": None,
         "variante": variante,
         "distancia_km": 3.0,
         "pin_cliente": "4821",
+        "pin_valido": False,
         "severidad": "critica",
+        "alerta_clima": None,
+        "suscriptores_alertas": [],
+        "dron_fallado": None,
     }
     base.update(extra)
     return base
@@ -52,37 +76,44 @@ def estado_inicial(variante="ok", **extra):
 
 def _g1_cliente_solicita(state):
     """AgenteCliente envía REQUEST a AgenteGestorPedidos."""
-    pedido = state["pedido"]
+    pedido = state["sistema"].cliente.solicitarPedido(**state["pedido"])
     contenido = f"solicitarPedido({pedido.get('paquete','')}, {pedido.get('ubicacion','')})"
-    return {"trazas": [
-        acl("REQUEST", "AgenteCliente", "AgenteGestorPedidos",
-            contenido, "FIPA-Request"),
-    ]}
+    return {
+        "pedido": pedido,
+        "trazas": [
+            acl("REQUEST", "AgenteCliente", "AgenteGestorPedidos",
+                contenido, "FIPA-Request"),
+        ],
+    }
 
 
 def _g1_gestor_valida(state):
     """AgenteGestorPedidos valida el pedido."""
-    return {"trazas": [
-        nota("AgenteGestorPedidos", "validarPedido()"),
-    ]}
+    return {
+        "pedido_valido": state["sistema"].gestor.validarPedido(state["pedido"]),
+        "trazas": [
+            nota("AgenteGestorPedidos", "validarPedido()"),
+        ],
+    }
 
 
 def _g1_decidir(state):
     """Rama: datos válidos o inválidos."""
-    pedido = state["pedido"]
-    if not pedido.get("ubicacion"):
-        return "datos_invalidos"
-    return "ok"
+    return "ok" if state["pedido_valido"] else "datos_invalidos"
 
 
 def _g1_ok(state):
     """Rama ok: AGREE + generarOrden + INFORM."""
-    return {"trazas": [
-        acl("AGREE", "AgenteGestorPedidos", "AgenteCliente", "pedido_aceptado"),
-        nota("AgenteGestorPedidos", "generarOrden()"),
-        acl("INFORM", "AgenteGestorPedidos", "AgenteCliente",
-            "orden_creada(ORD-001, estado = en_cola)"),
-    ]}
+    orden = state["sistema"].gestor.generarOrden(state["pedido"])
+    return {
+        "orden": orden,
+        "trazas": [
+            acl("AGREE", "AgenteGestorPedidos", "AgenteCliente", "pedido_aceptado"),
+            nota("AgenteGestorPedidos", "generarOrden()"),
+            acl("INFORM", "AgenteGestorPedidos", "AgenteCliente",
+                f"orden_creada({orden.id_pedido}, estado = {orden.estado})"),
+        ],
+    }
 
 
 def _g1_datos_invalidos(state):
@@ -119,31 +150,42 @@ def _g2_gestor_despacha(state):
     orden = state["orden"]
     return {"trazas": [
         acl("REQUEST", "AgenteGestorPedidos", "AgenteCoordinadorFlota",
-            f"despacharOrden({orden['idOrden']}, {orden.get('ubicacion','Bocagrande')})"),
+            f"despacharOrden({orden.id_pedido}, {orden.ubicacion})"),
     ]}
 
 
 def _g2_coordinador_acepta(state):
     """AgenteCoordinadorFlota responde AGREE, luego QUERY-IF al tráfico."""
-    return {"trazas": [
-        acl("AGREE", "AgenteCoordinadorFlota", "AgenteGestorPedidos",
-            "orden_recibida"),
-        acl("QUERY-IF", "AgenteCoordinadorFlota", "AgenteTraficoClima",
-            "zona_habilitada(sector_destino)?", "FIPA-Query"),
-    ]}
+    condiciones = state["sistema"].coordinador.consultarCondiciones(
+        state["orden"].ubicacion
+    )
+    return {
+        "condiciones_vuelo": condiciones,
+        "trazas": [
+            acl("AGREE", "AgenteCoordinadorFlota", "AgenteGestorPedidos",
+                "orden_recibida"),
+            acl("QUERY-IF", "AgenteCoordinadorFlota", "AgenteTraficoClima",
+                "zona_habilitada(sector_destino)?", "FIPA-Query"),
+        ],
+    }
 
 
 def _g2_trafico_verifica(state):
     """AgenteTraficoClima verifica zona."""
-    return {"trazas": [
-        nota("AgenteTraficoClima", "verificarZona()"),
-    ]}
+    sector = state["condiciones_vuelo"]["sector"]
+    return {
+        "zona_restringida": state["sistema"].trafico.verificarZona(sector),
+        "clima_favorable":
+            state["sistema"].entorno.condicionesClimaticas == "favorable",
+        "trazas": [
+            nota("AgenteTraficoClima", "verificarZona()"),
+        ],
+    }
 
 
 def _g2_decidir(state):
     """Rama: despejado o restringida."""
-    ubicacion = state["orden"].get("ubicacion", "")
-    if ubicacion in ("Base Naval", "Aeropuerto"):
+    if state["zona_restringida"] or not state["clima_favorable"]:
         return "restringida"
     return "despejado"
 
@@ -161,11 +203,16 @@ def _g2_despejado(state):
 def _g2_restringida(state):
     """Rama else: INFORM zona restringida + INFORM orden en espera."""
     orden = state["orden"]
+    motivo = (
+        "zona_restringida(sector_destino) = true"
+        if state["zona_restringida"]
+        else "clima_peligroso(sector_destino) = true"
+    )
     return {"trazas": [
         acl("INFORM", "AgenteTraficoClima", "AgenteCoordinadorFlota",
-            "zona_restringida(sector_destino) = true"),
+            motivo),
         acl("INFORM", "AgenteCoordinadorFlota", "AgenteGestorPedidos",
-            f"orden_en_espera({orden['idOrden']}, motivo)"),
+            f"orden_en_espera({orden.id_pedido}, motivo)"),
     ]}
 
 
@@ -198,84 +245,133 @@ def _calcular_eta(distancia_km, velocidad_kmh):
 
 
 def _g3_coordinador_cfp(state):
-    """AgenteCoordinadorFlota envía CFP a los 3 drones (par)."""
+    """AgenteCoordinadorFlota envía CFP a los drones disponibles."""
     dist = state["distancia_km"]
     orden = state["orden"]
-    msgs = [nota("AgenteCoordinadorFlota", "dronesDisponibles = [D1, D2, D3]")]
-    for d in state["drones_info"]:
-        msgs.append(acl("CFP", "AgenteCoordinadorFlota", d["id"],
-                        f"entregar({orden['idOrden']}, {dist})",
+    coordinador = state["sistema"].coordinador
+    disponibles = [
+        dron for dron in coordinador.dronesDisponibles
+        if dron.estado == EstadoDron.LIBRE
+    ]
+    if not any(pedido is orden for pedido in coordinador.colaEntregas):
+        coordinador.colaEntregas.append(orden)
+
+    nombres = [
+        dron.idDron.replace("AgenteDron", "D") for dron in disponibles
+    ]
+    msgs = [
+        nota("AgenteCoordinadorFlota",
+             f"dronesDisponibles = [{', '.join(nombres)}]")
+    ]
+    for d in disponibles:
+        msgs.append(acl("CFP", "AgenteCoordinadorFlota", d.idDron,
+                        f"entregar({orden.id_pedido}, {dist})",
                         "FIPA-Contract-Net"))
-    return {"trazas": msgs}
+    return {"drones_info": disponibles, "trazas": msgs}
 
 
 def _g3_drones_responden(state):
     """Cada dron evalúa su batería y responde PROPOSE o REFUSE."""
     dist = state["distancia_km"]
+    propuestas = []
     msgs = []
     for d in state["drones_info"]:
-        msgs.append(nota(d["id"], "revisar nivelBateria"))
+        msgs.append(nota(d.idDron, "revisar nivelBateria"))
     for d in state["drones_info"]:
-        eta = _calcular_eta(dist, d["velocidad"])
-        bat_req = eta * 2 + 10
-        if d["bateria"] >= bat_req:
-            utilidad = (d["bateria"] - bat_req) - 2 * eta
-            msgs.append(acl("PROPOSE", d["id"], "AgenteCoordinadorFlota",
-                           f"bateria = {d['bateria']}%, ETA = {eta} min"))
+        evaluacion = d.evaluarPropuesta(dist)
+        if evaluacion["puede"]:
+            propuestas.append({"dron": d, **evaluacion})
+            msgs.append(acl(
+                "PROPOSE", d.idDron, "AgenteCoordinadorFlota",
+                f"bateria = {d.nivelBateria}%, "
+                f"ETA = {evaluacion['eta_min']} min",
+            ))
         else:
-            msgs.append(acl("REFUSE", d["id"], "AgenteCoordinadorFlota",
-                           "bateria_insuficiente"))
-    return {"trazas": msgs}
+            msgs.append(acl(
+                "REFUSE", d.idDron, "AgenteCoordinadorFlota",
+                "bateria_insuficiente",
+            ))
+    return {"propuestas": propuestas, "trazas": msgs}
 
 
 def _g3_coordinador_evalua(state):
-    """Nota interna: optimizarEntregas()."""
-    return {"trazas": [
-        nota("AgenteCoordinadorFlota", "optimizarEntregas() (elige mayor utilidad)"),
-    ]}
+    """El coordinador elige la propuesta de mayor utilidad."""
+    mejor = state["sistema"].coordinador.optimizarEntregas(
+        state["propuestas"]
+    )
+    return {
+        "propuesta_seleccionada": mejor,
+        "dron_seleccionado": mejor["dron"] if mejor else None,
+        "trazas": [
+            nota("AgenteCoordinadorFlota",
+                 "optimizarEntregas() (elige mayor utilidad)"),
+        ],
+    }
 
 
 def _g3_decidir(state):
     """Rama: hay propuestas o ningún dron propone."""
-    dist = state["distancia_km"]
-    for d in state["drones_info"]:
-        eta = _calcular_eta(dist, d["velocidad"])
-        bat_req = eta * 2 + 10
-        if d["bateria"] >= bat_req:
-            return "normal"
-    return "sin_propuestas"
+    return (
+        "normal"
+        if state["propuesta_seleccionada"] is not None
+        else "sin_propuestas"
+    )
 
 
 def _g3_normal(state):
-    """Rama ok: ACCEPT-PROPOSAL al mejor, REJECT al resto, INFORM ruta."""
-    dist = state["distancia_km"]
+    """Asigna la propuesta elegida y rechaza las restantes."""
     orden = state["orden"]
-    propuestas = []
-    for d in state["drones_info"]:
-        eta = _calcular_eta(dist, d["velocidad"])
-        bat_req = eta * 2 + 10
-        if d["bateria"] >= bat_req:
-            utilidad = (d["bateria"] - bat_req) - 2 * eta
-            propuestas.append({"id": d["id"], "utilidad": utilidad, "eta": eta})
-    propuestas.sort(key=lambda p: p["utilidad"], reverse=True)
-    ganador = propuestas[0]["id"]
-    rechazados = [p["id"] for p in propuestas[1:]]
+    propuestas = state["propuestas"]
+    ganador = state["propuesta_seleccionada"]["dron"]
+    coordinador = state["sistema"].coordinador
+    asignacion = coordinador.asignarDron(ganador.idDron, orden.id_pedido)
+    if (
+        asignacion != {
+            "id_dron": ganador.idDron,
+            "id_orden": orden.id_pedido,
+        }
+        or ganador.estado != EstadoDron.ASIGNADO
+    ):
+        if ganador.estado == EstadoDron.ASIGNADO:
+            ganador.estado = EstadoDron.LIBRE
+        raise RuntimeError("La asignación del dron no se completó correctamente")
+
+    orden.estado = EstadoPedido.ASIGNADO
+    coordinador.colaEntregas[:] = [
+        pedido for pedido in coordinador.colaEntregas if pedido is not orden
+    ]
+    rechazados = [
+        propuesta["dron"] for propuesta in propuestas
+        if propuesta["dron"] is not ganador
+    ]
     msgs = []
-    msgs.append(acl("ACCEPT-PROPOSAL", "AgenteCoordinadorFlota", ganador,
-                     f"asignarDron({orden['idOrden']}, ruta)"))
+    msgs.append(acl("ACCEPT-PROPOSAL", "AgenteCoordinadorFlota",
+                    ganador.idDron,
+                    f"asignarDron({orden.id_pedido}, ruta)"))
     for r in rechazados:
-        msgs.append(acl("REJECT-PROPOSAL", "AgenteCoordinadorFlota", r,
-                        "propuesta_no_seleccionada"))
-    msgs.append(acl("INFORM", ganador, "AgenteCoordinadorFlota",
-                     f"ruta_asignada({orden['idOrden']})"))
-    return {"trazas": msgs}
+        msgs.append(acl("REJECT-PROPOSAL", "AgenteCoordinadorFlota",
+                        r.idDron, "propuesta_no_seleccionada"))
+    msgs.append(acl("INFORM", ganador.idDron, "AgenteCoordinadorFlota",
+                    f"ruta_asignada({orden.id_pedido})"))
+    msgs.append(nota(
+        "AgenteCoordinadorFlota",
+        "ACL de ruta conservado según el diagrama; el modelo no calcula "
+        "ni almacena una ruta",
+    ))
+    return {"dron_seleccionado": ganador, "trazas": msgs}
 
 
 def _g3_sin_propuestas(state):
     """Rama else: ningún dron propone, orden queda en cola."""
+    orden = state["orden"]
+    orden.estado = EstadoPedido.EN_COLA
+    coordinador = state["sistema"].coordinador
+    if not any(pedido is orden for pedido in coordinador.colaEntregas):
+        coordinador.colaEntregas.append(orden)
     return {"trazas": [
         nota("AgenteCoordinadorFlota",
-             "la orden permanece en colaEntregas y se reintenta el CFP"),
+             "la orden permanece en colaEntregas; el CFP podrá "
+             "reintentarse en una invocación posterior"),
     ]}
 
 
@@ -306,61 +402,122 @@ def _g4_dron_notifica_eta(state):
     """AgenteDron informa ETA al cliente."""
     orden = state["orden"]
     dist = state["distancia_km"]
-    # Dron 1 ya asignado
-    d = state["drones_info"][0]
-    eta = _calcular_eta(dist, d["velocidad"])
+    d = _g4_dron_asignado(state)
+    eta = _calcular_eta(dist, d.velocidad_kmh)
     return {"trazas": [
-        acl("INFORM", "AgenteDron1", "AgenteCliente",
-            f"hora_estimada_llegada({orden['idOrden']}, ETA = {eta} min)"),
+        acl("INFORM", d.idDron, "AgenteCliente",
+            f"hora_estimada_llegada({orden.id_pedido}, ETA = {eta} min)"),
     ]}
+
+def _g4_dron_asignado(state):
+    """Obtiene el dron seleccionado o busca el asignado en la flota."""
+    dron = state.get("dron_seleccionado")
+    if dron is None:
+        dron = next(
+            (d for d in state["sistema"].drones
+             if d.estado == EstadoDron.ASIGNADO),
+            None,
+        )
+    if dron is None or dron.estado != EstadoDron.ASIGNADO:
+        raise ValueError("El escenario 4 requiere un dron asignado")
+    return dron
 
 
 def _g4_dron_navega(state):
     """Loop: navegación del dron."""
+    d = _g4_dron_asignado(state)
+    d.navegarRuta()
+    if d.detectarObstaculo():
+        d.evitarColisiones()
     return {"trazas": [
-        nota("AgenteDron1", "navegarRuta() / detectarObstaculo() / evitarColisiones()"),
+        nota(d.idDron, "navegarRuta() / detectarObstaculo() / evitarColisiones()"),
     ]}
 
 
 def _g4_dron_solicita_presencia(state):
     """AgenteDron solicita confirmación de presencia al cliente."""
     orden = state["orden"]
+    d = _g4_dron_asignado(state)
     return {"trazas": [
-        acl("REQUEST", "AgenteDron1", "AgenteCliente",
-            f"confirmarPresencia({orden['idOrden']})"),
+        acl("REQUEST", d.idDron, "AgenteCliente",
+            f"confirmarPresencia({orden.id_pedido})"),
     ]}
+
+def _g4_cliente_ingresa_pin(state):
+    """El cliente ingresa el PIN y el dron lo valida."""
+    if state.get("variante") == "reprogramar":
+        return {"pin_valido": False, "trazas": []}
+
+    dron = _g4_dron_asignado(state)
+    cliente = state["sistema"].cliente
+    pin = cliente.ingresarPIN(state["pin_cliente"])
+    valido = dron.validarPIN(
+        pin, state["sistema"].politicasEntrega["pin_cliente"]
+    )
+    if not valido:
+        return {"pin_valido": False, "trazas": []}
+
+    return {
+        "pin_valido": True,
+        "trazas": [
+            acl("INFORM", "AgenteCliente", dron.idDron, "confirmacionPIN(****)"),
+            nota(dron.idDron, "validarPIN()"),
+        ],
+    }
 
 
 def _g4_decidir(state):
     """Rama: entrega o reprogramar."""
-    return state.get("variante", "entrega")
+    if state.get("variante") == "reprogramar" or not state["pin_valido"]:
+        return "reprogramar"
+    return "entrega"
 
 
 def _g4_entrega(state):
     """Rama ok: PIN + validación + entrega + confirmación + informe."""
     orden = state["orden"]
+    dron = _g4_dron_asignado(state)
+    if not state["pin_valido"]:
+        raise ValueError("No se puede entregar sin validar el PIN")
+    dron.entregarPaquete()
+    if dron.estado != EstadoDron.LIBRE:
+        raise RuntimeError("El dron no quedó libre después de la entrega")
+    if not state["sistema"].cliente.confirmarRecepcion():
+        raise RuntimeError("El cliente no confirmó la recepción")
+    orden.estado = EstadoPedido.ENTREGADO
     return {"trazas": [
-        acl("INFORM", "AgenteCliente", "AgenteDron1", "confirmacionPIN(****)"),
-        nota("AgenteDron1", "validarPIN()"),
-        nota("AgenteDron1", "entregarPaquete()"),
-        acl("INFORM", "AgenteDron1", "AgenteCliente",
-            f"paquete_entregado({orden['idOrden']})"),
-        acl("INFORM", "AgenteCliente", "AgenteDron1", "recepcion_confirmada"),
-        acl("INFORM", "AgenteDron1", "AgenteCoordinadorFlota",
-            f"entrega_exitosa({orden['idOrden']})"),
+        nota(dron.idDron, "entregarPaquete()"),
+        acl("INFORM", dron.idDron, "AgenteCliente",
+            f"paquete_entregado({orden.id_pedido})"),
+        acl("INFORM", "AgenteCliente", dron.idDron, "recepcion_confirmada"),
+        acl("INFORM", dron.idDron, "AgenteCoordinadorFlota",
+            f"entrega_exitosa({orden.id_pedido})"),
     ]}
 
 
 def _g4_reprogramar(state):
     """Rama else: reprogramación."""
     orden = state["orden"]
+    dron = _g4_dron_asignado(state)
+    reprogramacion = state["sistema"].cliente.reprogramarEntrega(
+        orden.id_pedido, "nuevaHora"
+    )
+    if reprogramacion != {
+        "id_orden": orden.id_pedido,
+        "nueva_hora": "nuevaHora",
+    }:
+        raise RuntimeError("El cliente no aceptó la solicitud de reprogramación")
+    dron.completarEnvio()
+    if dron.estado != EstadoDron.LIBRE:
+        raise RuntimeError("El dron no quedó libre tras la reprogramación")
+    orden.estado = EstadoPedido.REPROGRAMADO
     return {"trazas": [
-        acl("REQUEST", "AgenteCliente", "AgenteDron1",
-            f"reprogramarEntrega({orden['idOrden']}, nuevaHora)"),
-        acl("AGREE", "AgenteDron1", "AgenteCliente",
+        acl("REQUEST", "AgenteCliente", dron.idDron,
+            f"reprogramarEntrega({orden.id_pedido}, nuevaHora)"),
+        acl("AGREE", dron.idDron, "AgenteCliente",
             "reprogramacion_aceptada"),
-        acl("INFORM", "AgenteDron1", "AgenteCoordinadorFlota",
-            f"entrega_reprogramada({orden['idOrden']}, nuevaHora)"),
+        acl("INFORM", dron.idDron, "AgenteCoordinadorFlota",
+            f"entrega_reprogramada({orden.id_pedido}, nuevaHora)"),
     ]}
 
 
@@ -369,12 +526,14 @@ def construir_grafo_4():
     g.add_node("dron_notifica_eta", _g4_dron_notifica_eta)
     g.add_node("dron_navega", _g4_dron_navega)
     g.add_node("dron_solicita_presencia", _g4_dron_solicita_presencia)
+    g.add_node("cliente_ingresa_pin", _g4_cliente_ingresa_pin)
     g.add_node("g4_entrega", _g4_entrega)
     g.add_node("g4_reprogramar", _g4_reprogramar)
     g.set_entry_point("dron_notifica_eta")
     g.add_edge("dron_notifica_eta", "dron_navega")
     g.add_edge("dron_navega", "dron_solicita_presencia")
-    g.add_conditional_edges("dron_solicita_presencia", _g4_decidir, {
+    g.add_edge("dron_solicita_presencia", "cliente_ingresa_pin")
+    g.add_conditional_edges("cliente_ingresa_pin", _g4_decidir, {
         "entrega": "g4_entrega",
         "reprogramar": "g4_reprogramar",
     })
@@ -389,30 +548,47 @@ def construir_grafo_4():
 
 def _g5_suscripciones(state):
     """F y D se suscriben a alertas de T."""
+    dron = state["dron_seleccionado"]
     return {"trazas": [
         acl("SUBSCRIBE", "AgenteCoordinadorFlota", "AgenteTraficoClima",
             "notificar_alertas(sectores)", "FIPA-Subscribe"),
-        acl("SUBSCRIBE", "AgenteDron1", "AgenteTraficoClima",
+        acl("SUBSCRIBE", dron.idDron, "AgenteTraficoClima",
             "notificar_alertas(ruta_actual)"),
-    ]}
+    ], "suscriptores_alertas": ["AgenteCoordinadorFlota", dron.idDron]}
 
 
 def _g5_trafico_acepta(state):
     """T acepta suscripciones."""
+    dron = state["dron_seleccionado"]
     return {"trazas": [
         acl("AGREE", "AgenteTraficoClima", "AgenteCoordinadorFlota", ""),
-        acl("AGREE", "AgenteTraficoClima", "AgenteDron1", ""),
+        acl("AGREE", "AgenteTraficoClima", dron.idDron, ""),
     ]}
 
 
 def _g5_trafico_alerta(state):
     """T detecta evento y emite alertas (par)."""
-    return {"trazas": [
+    sistema = state["sistema"]
+    orden = state["orden"]
+    dron = state["dron_seleccionado"]
+    alerta = sistema.trafico.emitirAlerta(
+        orden.ubicacion, state.get("variante", "critica")
+    )
+    alerta_notificada = sistema.trafico.notificarSuscriptores(alerta)
+    if alerta_notificada is not alerta:
+        raise RuntimeError("La alerta notificada no coincide con la alerta emitida")
+
+    if alerta not in sistema.coordinador.alertasTrafico:
+        sistema.coordinador.alertasTrafico.append(alerta)
+    if alerta not in dron.alertasRecibidas:
+        dron.alertasRecibidas.append(alerta)
+
+    return {"alerta_clima": alerta, "severidad": alerta.severidad, "trazas": [
         nota("AgenteTraficoClima",
              "detectar ráfaga de viento / lluvia, emitirAlerta()"),
         acl("INFORM", "AgenteTraficoClima", "AgenteCoordinadorFlota",
             "alerta_clima(sector, severidad)"),
-        acl("INFORM", "AgenteTraficoClima", "AgenteDron1",
+        acl("INFORM", "AgenteTraficoClima", dron.idDron,
             "alerta_clima(sector, severidad)"),
     ]}
 
@@ -425,24 +601,36 @@ def _g5_decidir(state):
 def _g5_critica(state):
     """Rama crítica: F cancela, D aterriza, D informa."""
     orden = state["orden"]
+    dron = state["dron_seleccionado"]
+    dron.irACargar()
+    if dron.estado != EstadoDron.CARGANDO:
+        raise RuntimeError("El dron no quedó en estado de carga")
     return {"trazas": [
-        acl("CANCEL", "AgenteCoordinadorFlota", "AgenteDron1",
-            f"cancelar_entrega({orden['idOrden']})"),
-        nota("AgenteDron1", "aterrizar / ir a cargar batería"),
-        acl("INFORM", "AgenteDron1", "AgenteCoordinadorFlota",
-            f"entrega_cancelada({orden['idOrden']})"),
+        acl("CANCEL", "AgenteCoordinadorFlota", dron.idDron,
+            f"cancelar_entrega({orden.id_pedido})"),
+        nota(dron.idDron, "aterrizar / ir a cargar batería"),
+        acl("INFORM", dron.idDron, "AgenteCoordinadorFlota",
+            f"entrega_cancelada({orden.id_pedido})"),
     ]}
 
 
 def _g5_moderada(state):
     """Rama moderada: D solicita nueva ruta, F acepta y envía."""
     orden = state["orden"]
+    dron = state["dron_seleccionado"]
+    if not dron.solicitarNuevasRutas():
+        raise RuntimeError("El dron no pudo solicitar una nueva ruta")
+    if not state["sistema"].coordinador.solicitarRutas():
+        raise RuntimeError("El coordinador no pudo solicitar rutas")
     return {"trazas": [
-        acl("REQUEST", "AgenteDron1", "AgenteCoordinadorFlota",
-            f"solicitarNuevaRuta({orden['idOrden']}, evitar = sector)"),
-        acl("AGREE", "AgenteCoordinadorFlota", "AgenteDron1", ""),
-        acl("INFORM", "AgenteCoordinadorFlota", "AgenteDron1",
-            f"nueva_ruta({orden['idOrden']}, ruta)"),
+        acl("REQUEST", dron.idDron, "AgenteCoordinadorFlota",
+            f"solicitarNuevaRuta({orden.id_pedido}, evitar = sector)"),
+        acl("AGREE", "AgenteCoordinadorFlota", dron.idDron, ""),
+        acl("INFORM", "AgenteCoordinadorFlota", dron.idDron,
+            f"nueva_ruta({orden.id_pedido}, ruta)"),
+        nota("AgenteCoordinadorFlota",
+             "ACL conservado como traza del diagrama; los agentes no calculan "
+             "ni almacenan una ruta alternativa"),
     ]}
 
 
@@ -472,77 +660,132 @@ def construir_grafo_5():
 def _g6_dron_falla(state):
     """AgenteDron detecta falla y notifica."""
     orden = state["orden"]
+    dron = state["dron_seleccionado"]
+    if not isinstance(orden, Pedido) or not isinstance(dron, AgenteDron):
+        raise ValueError("El escenario 6 requiere un Pedido y un AgenteDron reales")
+    dron.estado = EstadoDron.FALLA
     return {"trazas": [
         nota("AgenteDron1", "detecta falla mecánica o cambio brusco de clima"),
         acl("FAILURE", "AgenteDron1", "AgenteCoordinadorFlota",
-            f"entrega_abortada({orden['idOrden']}, causa)"),
-    ]}
+            f"entrega_abortada({orden.id_pedido}, causa)"),
+    ], "dron_fallado": dron}
 
 
 def _g6_coordinador_responde(state):
-    """F ordena aterrizar, D acepta, D informa al cliente."""
+    """F solicita el retorno; el modelo no simula la maniobra física."""
     orden = state["orden"]
+    dron = state["dron_fallado"]
     return {"trazas": [
         acl("REQUEST", "AgenteCoordinadorFlota", "AgenteDron1",
             "aterrizar_y_retornar_a_base"),
         acl("AGREE", "AgenteDron1", "AgenteCoordinadorFlota", ""),
         acl("INFORM", "AgenteDron1", "AgenteCliente",
-            f"entrega_demorada({orden['idOrden']})"),
+            f"entrega_demorada({orden.id_pedido})"),
+        nota("AgenteDron1",
+             "la solicitud de retorno queda en la traza; el modelo no "
+             "implementa una maniobra física"),
     ]}
 
 
 def _g6_coordinador_notifica_gestor(state):
     """F informa al gestor, gestor pone orden en cola, gestor pide despachar."""
     orden = state["orden"]
+    orden.estado = EstadoPedido.EN_COLA
+    gestor = state["sistema"].gestor
+    gestor.estadoOrden = EstadoPedido.EN_COLA
+    cola = state["sistema"].coordinador.colaEntregas
+    if not any(pedido is orden for pedido in cola):
+        cola.append(orden)
     return {"trazas": [
         acl("INFORM", "AgenteCoordinadorFlota", "AgenteGestorPedidos",
-            f"orden_pendiente_reasignacion({orden['idOrden']})"),
+            f"orden_pendiente_reasignacion({orden.id_pedido})"),
         nota("AgenteGestorPedidos", "estadoOrden = en_cola"),
         acl("REQUEST", "AgenteGestorPedidos", "AgenteCoordinadorFlota",
-            f"despacharOrden({orden['idOrden']})"),
+            f"despacharOrden({orden.id_pedido})"),
     ]}
 
 
 def _g6_coordinador_reasigna_nota(state):
-    """Nota: reinicia la asignación de dron."""
-    return {"trazas": [
-        nota("AgenteCoordinadorFlota",
-             "reinicia la asignación de dron (CFP, ver Diagrama 3)"),
-    ]}
+    """Evalúa con Contract-Net los drones libres distintos del averiado."""
+    coordinador = state["sistema"].coordinador
+    dron_fallado = state["dron_fallado"]
+    propuestas = []
+    for dron in coordinador.dronesDisponibles:
+        if dron is dron_fallado or dron.estado != EstadoDron.LIBRE:
+            continue
+        evaluacion = dron.evaluarPropuesta(state["distancia_km"])
+        if evaluacion["puede"]:
+            propuestas.append({"dron": dron, **evaluacion})
+
+    propuesta = coordinador.optimizarEntregas(propuestas)
+    return {
+        "propuestas": propuestas,
+        "propuesta_seleccionada": propuesta,
+        "trazas": [
+            nota("AgenteCoordinadorFlota",
+                 "reinicia la asignación de dron (CFP, ver Diagrama 3)"),
+        ],
+    }
 
 
 def _g6_decidir(state):
     """Rama: hay dron disponible o sin drones."""
-    dist = state["distancia_km"]
-    # Excluimos AgenteDron1 (el que falló)
-    for d in state["drones_info"][1:]:
-        eta = _calcular_eta(dist, d["velocidad"])
-        bat_req = eta * 2 + 10
-        if d["bateria"] >= bat_req:
-            return "con_dron"
-    return "sin_drones"
+    return (
+        "con_dron"
+        if state["propuesta_seleccionada"] is not None
+        else "sin_drones"
+    )
 
 
 def _g6_con_dron(state):
     """Rama ok: dron reasignado."""
     orden = state["orden"]
+    propuesta = state["propuesta_seleccionada"]
+    dron = propuesta["dron"]
+    if dron is state["dron_fallado"]:
+        raise RuntimeError("No se puede reasignar el dron averiado")
+    coordinador = state["sistema"].coordinador
+    asignacion = coordinador.asignarDron(dron.idDron, orden.id_pedido)
+    if (
+        asignacion != {
+            "id_dron": dron.idDron,
+            "id_orden": orden.id_pedido,
+        }
+        or dron.estado != EstadoDron.ASIGNADO
+    ):
+        raise RuntimeError("No se pudo completar la reasignación del dron")
+
+    orden.estado = EstadoPedido.ASIGNADO
+    state["sistema"].gestor.estadoOrden = EstadoPedido.ASIGNADO
+    coordinador.colaEntregas[:] = [
+        pedido for pedido in coordinador.colaEntregas
+        if pedido is not orden
+    ]
     return {"trazas": [
+        # LangGraph persistirá la identidad del dron reasignado en el estado.
         acl("INFORM", "AgenteCoordinadorFlota", "AgenteGestorPedidos",
-            f"dron_reasignado({orden['idOrden']}, nuevaETA)"),
+            f"dron_reasignado({orden.id_pedido}, "
+            f"{propuesta['eta_min']} min)"),
         acl("INFORM", "AgenteGestorPedidos", "AgenteCliente",
-            f"nueva_hora_estimada({orden['idOrden']})"),
-    ]}
+            f"nueva_hora_estimada({orden.id_pedido})"),
+    ], "dron_seleccionado": dron}
 
 
 def _g6_sin_drones(state):
     """Rama else: sin drones disponibles."""
     orden = state["orden"]
+    orden.estado = EstadoPedido.EN_COLA
+    gestor = state["sistema"].gestor
+    gestor.estadoOrden = EstadoPedido.EN_COLA
+    cola = state["sistema"].coordinador.colaEntregas
+    if not any(pedido is orden for pedido in cola):
+        cola.append(orden)
     return {"trazas": [
         acl("FAILURE", "AgenteCoordinadorFlota", "AgenteGestorPedidos",
-            f"sin_drones_disponibles({orden['idOrden']})"),
+            f"sin_drones_disponibles({orden.id_pedido})"),
         acl("INFORM", "AgenteGestorPedidos", "AgenteCliente",
-            f"entrega_reprogramada({orden['idOrden']})"),
-    ]}
+            f"entrega_reprogramada({orden.id_pedido})"),
+    ], "dron_seleccionado": None}
 
 
 def construir_grafo_6():
@@ -596,24 +839,189 @@ def _estado_para_variante(n, variante):
 
     if n == 1 and variante == "datos_invalidos":
         st["pedido"] = {"paquete": "Paquete-001", "ubicacion": ""}
-    elif n == 2 and variante == "restringida":
-        st["orden"]["ubicacion"] = "Base Naval"
-    elif n == 3 and variante == "sin_propuestas":
-        st["drones_info"] = [
-            {"id": "AgenteDron1", "bateria": 20, "velocidad": 22.5},
-            {"id": "AgenteDron2", "bateria": 20, "velocidad": 15.0},
-            {"id": "AgenteDron3", "bateria": 20, "velocidad": 20.0},
-        ]
-    elif n == 4 and variante == "reprogramar":
-        st["variante"] = "reprogramar"
-    elif n == 5 and variante == "moderada":
-        st["variante"] = "moderada"
-    elif n == 6 and variante == "sin_drones":
-        st["drones_info"] = [
-            {"id": "AgenteDron1", "bateria": 85, "velocidad": 22.5},
-            {"id": "AgenteDron2", "bateria": 20, "velocidad": 15.0},
-            {"id": "AgenteDron3", "bateria": 20, "velocidad": 20.0},
-        ]
+    elif n == 2 and st.get("orden") is None:
+        ubicacion = "Base Naval" if variante == "restringida" else "Bocagrande"
+        solicitud = st["sistema"].cliente.solicitarPedido(
+            "Paquete-001", ubicacion
+        )
+        if not st["sistema"].gestor.validarPedido(solicitud):
+            raise ValueError("No se pudo preparar la orden para el escenario 2")
+        st["orden"] = st["sistema"].gestor.generarOrden(solicitud)
+    elif n == 3:
+        if st["orden"] is None:
+            solicitud = st["sistema"].cliente.solicitarPedido(
+                "Paquete-001", "Bocagrande"
+            )
+            if not st["sistema"].gestor.validarPedido(solicitud):
+                raise ValueError("No se pudo preparar la orden para el escenario 3")
+            st["orden"] = st["sistema"].gestor.generarOrden(solicitud)
+        if variante == "sin_propuestas":
+            for dron in st["sistema"].drones:
+                dron.nivelBateria = 20
+    elif n == 4:
+        orden_existente = st["orden"] is not None
+        if st["orden"] is None:
+            solicitud = st["sistema"].cliente.solicitarPedido(
+                "Paquete-001", "Bocagrande"
+            )
+            if not st["sistema"].gestor.validarPedido(solicitud):
+                raise ValueError("No se pudo preparar la orden para el escenario 4")
+            st["orden"] = st["sistema"].gestor.generarOrden(solicitud)
+        if st["dron_seleccionado"] is None:
+            asignados = [
+                d for d in st["sistema"].drones
+                if d.estado == EstadoDron.ASIGNADO
+            ]
+            if orden_existente and st["orden"].estado == EstadoPedido.ASIGNADO:
+                if len(asignados) != 1:
+                    raise ValueError(
+                        "No se puede identificar de forma inequívoca "
+                        "el dron ya asignado"
+                    )
+                dron = asignados[0]
+            else:
+                dron = next(
+                    (d for d in st["sistema"].drones
+                     if d.estado == EstadoDron.LIBRE),
+                    None,
+                )
+                if dron is None:
+                    raise ValueError("No hay drones libres para el escenario 4")
+                asignacion = st["sistema"].coordinador.asignarDron(
+                    dron.idDron, st["orden"].id_pedido
+                )
+                if (
+                    asignacion != {
+                        "id_dron": dron.idDron,
+                        "id_orden": st["orden"].id_pedido,
+                    }
+                    or dron.estado != EstadoDron.ASIGNADO
+                ):
+                    raise RuntimeError("No se pudo asignar el dron al escenario 4")
+                st["orden"].estado = EstadoPedido.ASIGNADO
+            st["dron_seleccionado"] = dron
+    elif n == 5:
+        if st["orden"] is None:
+            orden_existente = next(
+                (orden for orden in st["sistema"].gestor.listaPedidos
+                 if isinstance(orden, Pedido)),
+                None,
+            )
+            if orden_existente is not None:
+                st["orden"] = orden_existente
+            else:
+                solicitud = st["sistema"].cliente.solicitarPedido(
+                    "Paquete-001", "Bocagrande"
+                )
+                if not st["sistema"].gestor.validarPedido(solicitud):
+                    raise ValueError(
+                        "No se pudo preparar la orden para el escenario 5"
+                    )
+                st["orden"] = st["sistema"].gestor.generarOrden(solicitud)
+        if st["dron_seleccionado"] is None:
+            drones_asignados = [
+                dron for dron in st["sistema"].drones
+                if dron.estado == EstadoDron.ASIGNADO
+            ]
+            if st["orden"].estado == EstadoPedido.ASIGNADO:
+                if len(drones_asignados) != 1:
+                    raise ValueError(
+                        "No se puede identificar de forma inequívoca "
+                        "el dron asignado al escenario 5"
+                    )
+                dron = drones_asignados[0]
+            else:
+                dron = next(
+                    (dron for dron in st["sistema"].drones
+                     if dron.estado == EstadoDron.LIBRE),
+                    None,
+                )
+                if dron is None:
+                    raise ValueError("No hay drones libres para el escenario 5")
+                asignacion = st["sistema"].coordinador.asignarDron(
+                    dron.idDron, st["orden"].id_pedido
+                )
+                if (
+                    asignacion != {
+                        "id_dron": dron.idDron,
+                        "id_orden": st["orden"].id_pedido,
+                    }
+                    or dron.estado != EstadoDron.ASIGNADO
+                ):
+                    raise RuntimeError(
+                        "No se pudo asignar el dron para el escenario 5"
+                    )
+                st["orden"].estado = EstadoPedido.ASIGNADO
+            st["dron_seleccionado"] = dron
+    elif n == 6:
+        sistema = st["sistema"]
+        if st["orden"] is None:
+            orden_existente = next(
+                (orden for orden in sistema.gestor.listaPedidos
+                 if isinstance(orden, Pedido)),
+                None,
+            )
+            if orden_existente is None:
+                solicitud = sistema.cliente.solicitarPedido(
+                    "Paquete-001", "Bocagrande"
+                )
+                if not sistema.gestor.validarPedido(solicitud):
+                    raise ValueError(
+                        "No se pudo preparar la orden para el escenario 6"
+                    )
+                orden_existente = sistema.gestor.generarOrden(solicitud)
+            st["orden"] = orden_existente
+
+        if st["dron_seleccionado"] is None:
+            if st["orden"].estado in (
+                EstadoPedido.ASIGNADO,
+                EstadoPedido.EN_VUELO,
+            ):
+                asignados = [
+                    dron for dron in sistema.drones
+                    if dron.estado in (
+                        EstadoDron.ASIGNADO,
+                        EstadoDron.EN_VUELO,
+                    )
+                ]
+                if len(asignados) != 1:
+                    raise ValueError(
+                        "No se puede identificar de forma inequívoca "
+                        "el dron del pedido para el escenario 6"
+                    )
+                dron_fallado = asignados[0]
+            else:
+                dron_fallado = next(
+                    (dron for dron in sistema.drones
+                     if dron.estado == EstadoDron.LIBRE),
+                    None,
+                )
+                if dron_fallado is None:
+                    raise ValueError(
+                        "No hay un dron libre para preparar el escenario 6"
+                    )
+                asignacion = sistema.coordinador.asignarDron(
+                    dron_fallado.idDron, st["orden"].id_pedido
+                )
+                if (
+                    asignacion != {
+                        "id_dron": dron_fallado.idDron,
+                        "id_orden": st["orden"].id_pedido,
+                    }
+                    or dron_fallado.estado != EstadoDron.ASIGNADO
+                ):
+                    raise RuntimeError(
+                        "No se pudo asignar el dron inicial del escenario 6"
+                    )
+                st["orden"].estado = EstadoPedido.ASIGNADO
+            st["dron_seleccionado"] = dron_fallado
+
+        if st["dron_seleccionado"] not in sistema.drones:
+            raise ValueError("El dron seleccionado no pertenece al sistema")
+        if variante == "sin_drones":
+            for dron in sistema.drones:
+                if dron is not st["dron_seleccionado"]:
+                    dron.nivelBateria = 20
     return st
 
 
@@ -628,18 +1036,18 @@ def ejecutar(n, variante=None):
 
 
 def flujo_completo():
-    """Encadena grafos 1 -> 2 -> 3 -> 4 con el camino principal."""
+    """Encadena los grafos 1 -> 2 -> 3 -> 4 sobre un sistema compartido."""
+    sistema = SistemaEntregaDrones()
+    estado = estado_inicial("ok", sistema=sistema)
     todas = []
-    # Grafo 1: solicitud ok
-    t1 = ejecutar(1, "ok")
-    todas.extend(t1)
-    # Grafo 2: despejado
-    t2 = ejecutar(2, "despejado")
-    todas.extend(t2)
-    # Grafo 3: normal (con drones por defecto)
-    t3 = ejecutar(3, "normal")
-    todas.extend(t3)
-    # Grafo 4: entrega exitosa
-    t4 = ejecutar(4, "entrega")
-    todas.extend(t4)
+    for numero, variante in (
+        (1, "ok"),
+        (2, "despejado"),
+        (3, "normal"),
+        (4, "entrega"),
+    ):
+        estado["variante"] = variante
+        estado["trazas"] = []
+        estado = CONSTRUCTORES[numero]().invoke(estado)
+        todas.extend(estado["trazas"])
     return todas
